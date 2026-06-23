@@ -21,22 +21,55 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import tty
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List
 
-FEATURES = [
-    "1password", "agent-browser", "browser-native-messaging", "chromium-full",
-    "chromium-headless", "cleanshot", "clipboard", "cloud-credentials",
-    "cloud-storage", "docker", "electron", "keychain", "kubectl", "lldb",
-    "macos-gui", "microphone", "playwright-chrome", "process-control",
-    "shell-init", "spotlight", "ssh", "vscode", "xcode", "all-agents",
-    "all-apps", "wide-read",
+FEATURE_GROUPS = [
+    ("Developer tools", [
+        ("Shell startup files", "shell-init"),
+        ("Process control", "process-control"),
+        ("LLDB", "lldb"),
+        ("Xcode", "xcode"),
+        ("VS Code", "vscode"),
+    ]),
+    ("Cloud / credentials", [
+        ("Cloud credentials", "cloud-credentials"),
+        ("Cloud storage", "cloud-storage"),
+        ("1Password", "1password"),
+        ("Keychain", "keychain"),
+    ]),
+    ("Desktop / browser", [
+        ("macOS GUI", "macos-gui"),
+        ("Clipboard", "clipboard"),
+        ("Microphone", "microphone"),
+        ("Chromium headless", "chromium-headless"),
+        ("Chromium full", "chromium-full"),
+        ("Electron", "electron"),
+        ("Playwright Chrome", "playwright-chrome"),
+        ("Agent browser", "agent-browser"),
+        ("Browser native messaging", "browser-native-messaging"),
+        ("CleanShot", "cleanshot"),
+    ]),
+    ("Containers / remote", [
+        ("Docker", "docker"),
+        ("Kubernetes", "kubectl"),
+        ("SSH", "ssh"),
+    ]),
+    ("Broad presets", [
+        ("All agent profiles", "all-agents"),
+        ("All app profiles", "all-apps"),
+        ("Wide read access", "wide-read"),
+    ]),
 ]
 
+FEATURE_LABELS = {feature: label for _, entries in FEATURE_GROUPS for label, feature in entries}
+FEATURES = list(FEATURE_LABELS)
+
 CONFIG_PATH = Path.cwd() / ".safehouse-plus.json"
-SAFEHOUSE = os.environ.get("SAFEHOUSE", "safehouse")
+SAFEHOUSE = os.environ.get("SAFEHOUSE") or ("./safehouse" if os.access("./safehouse", os.X_OK) else "safehouse")
 LAST_RESUME_COMMAND: List[str] | None = None
 
 CP_TITLE = 1
@@ -55,7 +88,7 @@ def init_colors() -> None:
     curses.use_default_colors()
     curses.init_pair(CP_TITLE, curses.COLOR_CYAN, -1)
     curses.init_pair(CP_MUTED, curses.COLOR_WHITE, -1)
-    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(CP_SELECTED, curses.COLOR_CYAN, -1)
     curses.init_pair(CP_GOOD, curses.COLOR_GREEN, -1)
     curses.init_pair(CP_WARN, curses.COLOR_YELLOW, -1)
     curses.init_pair(CP_BAD, curses.COLOR_RED, -1)
@@ -75,6 +108,13 @@ def addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
 
 def shell_join(argv: List[str]) -> str:
     return " ".join(shlex.quote(a) for a in argv)
+
+
+def parse_command(text: str) -> List[str] | None:
+    try:
+        return shlex.split(text) if text else []
+    except ValueError:
+        return None
 
 
 def command_available(command: str) -> bool:
@@ -119,6 +159,37 @@ def sb_quote(s: str) -> str:
     return json.dumps(os.path.expanduser(s))
 
 
+def unique(xs: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for x in xs:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def sandbox_path_clause(path: str) -> str:
+    expanded = os.path.expanduser(path)
+    kind = "subpath" if path.endswith("/") or os.path.isdir(expanded) else "literal"
+    return f"    ({kind} {sb_quote(path)})"
+
+
+def sandbox_rule(action: str, operations: str, paths: List[str]) -> str:
+    return f"({action} {operations}\n" + "\n".join(sandbox_path_clause(p) for p in paths) + "\n)"
+
+
+def socket_paths(state: "State") -> List[str]:
+    paths: List[str] = []
+    if state.docker_socket:
+        paths += ["/var/run/docker.sock", "~/.docker/run/docker.sock"]
+    if state.podman_socket:
+        paths += ["/run/podman/podman.sock", "~/.local/share/containers/podman/machine/podman.sock"]
+    if state.ssh_agent_socket and os.environ.get("SSH_AUTH_SOCK"):
+        paths.append(os.environ["SSH_AUTH_SOCK"])
+    return unique(paths)
+
+
 @dataclass
 class State:
     command: List[str] = field(default_factory=list)
@@ -131,6 +202,13 @@ class State:
     workdir: str = ""
     env_mode: str = "sanitized"  # sanitized | full
     env_pass: List[str] = field(default_factory=list)
+    env_file: str = ""
+    env_file_enabled: bool = False
+    docker_socket: bool = False
+    podman_socket: bool = False
+    ssh_agent_socket: bool = False
+    path_overrides: dict[str, str] = field(default_factory=dict)  # default path/category -> ro|rw|deny|off
+    expanded_path_categories: List[str] = field(default_factory=list)
     trust_workdir_config: bool = False
 
     @classmethod
@@ -150,17 +228,21 @@ class State:
         args: List[str] = []
         if self.enabled:
             args += [f"--enable={','.join(self.enabled)}"]
-        if self.ro_paths:
-            args += [f"--add-dirs-ro={split_colon(self.ro_paths)}"]
-        if self.rw_paths:
-            args += [f"--add-dirs={split_colon(self.rw_paths)}"]
-        if self.workdir:
-            args += [f"--workdir={self.workdir}"]
+        ro_overrides, rw_overrides = override_allow_paths(self)
+        ro_paths = unique(self.ro_paths + ro_overrides)
+        rw_paths = unique(self.rw_paths + rw_overrides)
+        if ro_paths:
+            args += [f"--add-dirs-ro={split_colon(ro_paths)}"]
+        if rw_paths:
+            args += [f"--add-dirs={split_colon(rw_paths)}"]
+        args += [f"--workdir={self.workdir or str(Path.cwd())}"]
         if self.trust_workdir_config:
             args += ["--trust-workdir-config"]
         if self.env_mode == "full":
             args += ["--env"]
-        if self.env_pass:
+        elif self.env_file_enabled and self.env_file:
+            args += [f"--env={self.env_file}"]
+        if self.env_pass and self.env_mode != "full":
             args += [f"--env-pass={','.join(self.env_pass)}"]
         if append_profile:
             args += [f"--append-profile={append_profile}"]
@@ -170,12 +252,28 @@ class State:
         rules: List[str] = []
         if not self.network:
             rules.append("(deny network*)")
-        if self.deny_paths:
+        allow_literals = socket_paths(self)
+        if allow_literals:
+            rules.append(sandbox_rule("allow", "file-read* file-write*", allow_literals))
+        deny_write_paths: List[str] = []
+        deny_paths = list(self.deny_paths)
+        if self.path_overrides.get(str(CONFIG_PATH), "deny") == "deny":
+            deny_paths.append(str(CONFIG_PATH))
+        for path, mode in self.path_overrides.items():
+            paths = paths_for_override(self, path)
+            if mode == "ro" and default_mode(path) == "rw":
+                deny_write_paths.extend(paths)
+            elif mode in {"deny", "off"}:
+                deny_paths.extend(paths)
+        if deny_write_paths:
             entries = []
-            for p in self.deny_paths:
-                expanded = os.path.expanduser(p)
-                kind = "subpath" if p.endswith("/") or os.path.isdir(expanded) else "literal"
-                entries.append(f"    ({kind} {sb_quote(p)})")
+            for p in unique(deny_write_paths):
+                entries.append(sandbox_path_clause(p))
+            rules.append("(deny file-write*\n" + "\n".join(entries) + "\n)")
+        if deny_paths:
+            entries = []
+            for p in unique(deny_paths):
+                entries.append(sandbox_path_clause(p))
             rules.append("(deny file-read* file-write*\n" + "\n".join(entries) + "\n)")
         if not rules:
             return None
@@ -337,133 +435,6 @@ def prompt(stdscr, title: str, initial: str = "", complete_path: bool = False) -
         curses.curs_set(old_cursor)
 
 
-def choose_feature(stdscr, state: State) -> None:
-    idx = 0
-    while True:
-        stdscr.erase()
-        stdscr.addstr(0, 0, "Toggle features: Ctrl-p/Ctrl-n navigate, Enter/Space toggle, q/backspace return")
-        h, _ = stdscr.getmaxyx()
-        for i, feat in enumerate(FEATURES[max(0, idx - h + 3): max(0, idx - h + 3) + h - 2], start=max(0, idx - h + 3)):
-            mark = "[x]" if feat in state.enabled else "[ ]"
-            prefix = "> " if i == idx else "  "
-            stdscr.addstr(i - max(0, idx - h + 3) + 1, 0, f"{prefix}{mark} {feat}")
-        ch = safe_getch(stdscr)
-        if ch in (3, ord('q'), 27, curses.KEY_BACKSPACE, 127):
-            return
-        if ch in (curses.KEY_UP, ord('k'), 16):  # Ctrl-p
-            idx = max(0, idx - 1)
-        elif ch in (curses.KEY_DOWN, ord('j'), 14):  # Ctrl-n
-            idx = min(len(FEATURES) - 1, idx + 1)
-        elif is_activate_key(ch):
-            feat = FEATURES[idx]
-            if feat in state.enabled:
-                state.enabled.remove(feat)
-            else:
-                state.enabled.append(feat)
-                state.enabled.sort()
-
-
-def edit_paths(stdscr, state: State) -> None:
-    def mode_for(path: str) -> str:
-        if path in state.rw_paths:
-            return "rw"
-        if path in state.ro_paths:
-            return "ro"
-        if path in state.deny_paths:
-            return "deny"
-        return "off"
-
-    def set_mode(path: str, mode: str) -> None:
-        if path not in state.paths:
-            state.paths.append(path)
-        for paths in (state.ro_paths, state.rw_paths, state.deny_paths):
-            while path in paths:
-                paths.remove(path)
-        if mode == "ro":
-            state.ro_paths.append(path)
-        elif mode == "rw":
-            state.rw_paths.append(path)
-        elif mode == "deny":
-            state.deny_paths.append(path)
-
-    def cycle(path: str) -> None:
-        modes = ["ro", "rw", "deny", "off"]
-        set_mode(path, modes[(modes.index(mode_for(path)) + 1) % len(modes)])
-
-    idx = 0
-    while True:
-        paths = sorted(set(state.paths + state.ro_paths + state.rw_paths + state.deny_paths))
-        idx = min(idx, max(0, len(paths) - 1))
-        stdscr.erase()
-        addstr(stdscr, 0, 0, "Paths: Enter/Space toggle ro→rw→deny→off, a add, e edit, d delete, q return", color(CP_TITLE, curses.A_BOLD))
-        if not paths:
-            addstr(stdscr, 2, 2, "(empty)", color(CP_MUTED))
-        for i, path in enumerate(paths[: curses.LINES - 2]):
-            mode = mode_for(path)
-            attr = color(CP_SELECTED) if i == idx else 0
-            mode_attr = {"ro": color(CP_ACCENT), "rw": color(CP_GOOD), "deny": color(CP_BAD)}.get(mode, 0)
-            prefix = "> " if i == idx else "  "
-            addstr(stdscr, i + 1, 0, prefix, attr)
-            addstr(stdscr, i + 1, 2, f"[{mode:4}] ", mode_attr | (curses.A_BOLD if mode != "off" else 0))
-            addstr(stdscr, i + 1, 9, path, attr)
-        ch = safe_getch(stdscr)
-        if ch in (3, ord('q'), 27, curses.KEY_BACKSPACE, 127):
-            return
-        if ch in (curses.KEY_UP, ord('k'), 16):
-            idx = max(0, idx - 1)
-        elif ch in (curses.KEY_DOWN, ord('j'), 14):
-            idx = min(max(0, len(paths) - 1), idx + 1)
-        elif is_activate_key(ch) and paths:
-            cycle(paths[idx])
-        elif ch == ord('a'):
-            s = prompt(stdscr, "Add path", "", complete_path=True)
-            if s:
-                set_mode(s, "rw")
-        elif ch == ord('e') and paths:
-            old = paths[idx]
-            s = prompt(stdscr, "Edit path", old, complete_path=True)
-            if s:
-                old_mode = mode_for(old)
-                set_mode(old, "off")
-                set_mode(s, old_mode if old_mode != "off" else "rw")
-        elif ch == ord('d') and paths:
-            path = paths[idx]
-            set_mode(path, "off")
-            while path in state.paths:
-                state.paths.remove(path)
-            idx = min(idx, max(0, len(paths) - 2))
-
-
-def edit_list(stdscr, title: str, items: List[str]) -> None:
-    idx = 0
-    while True:
-        stdscr.erase()
-        stdscr.addstr(0, 0, f"{title}: Ctrl-p/Ctrl-n navigate, a add, e edit, d delete, q return")
-        if not items:
-            stdscr.addstr(2, 2, "(empty)")
-        for i, item in enumerate(items[: curses.LINES - 2]):
-            prefix = "> " if i == idx else "  "
-            stdscr.addstr(i + 1, 0, f"{prefix}{item}"[: curses.COLS - 1])
-        ch = safe_getch(stdscr)
-        if ch in (3, ord('q'), 27, curses.KEY_BACKSPACE, 127):
-            return
-        if ch in (curses.KEY_UP, ord('k'), 16):  # Ctrl-p
-            idx = max(0, idx - 1)
-        elif ch in (curses.KEY_DOWN, ord('j'), 14):  # Ctrl-n
-            idx = min(max(0, len(items) - 1), idx + 1)
-        elif ch == ord('a'):
-            s = prompt(stdscr, f"Add {title}", "")
-            if s:
-                items.append(s)
-        elif ch == ord('e') and items:
-            s = prompt(stdscr, f"Edit {title}", items[idx])
-            if s is not None and s != "":
-                items[idx] = s
-        elif ch == ord('d') and items:
-            del items[idx]
-            idx = min(idx, max(0, len(items) - 1))
-
-
 def show_text(stdscr, title: str, text: str) -> None:
     lines = text.splitlines() or [""]
     top = 0
@@ -528,14 +499,26 @@ def terminal_winsize() -> bytes:
         return struct.pack("HHHH", rows, cols, 0, 0)
 
 
-def run_pty_capture(argv: List[str]) -> str:
-    """Run argv in a fresh PTY, with the real terminal size/mode restored."""
+def exit_code(status: int) -> int:
+    try:
+        return os.waitstatus_to_exitcode(status)
+    except ValueError:
+        return 1
+
+
+def run_pty_capture(argv: List[str]) -> tuple[str, int]:
+    """Run argv in a fresh PTY, returning recent output and exit status."""
     captured = bytearray()
     max_capture = 250_000
+    status_code = 1
     pid, master_fd = pty.fork()
 
     if pid == 0:
-        os.execvp(argv[0], argv)
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            print(f"safehouse+: failed to execute {argv[0]!r}: {e}", file=sys.stderr, flush=True)
+            os._exit(127)
 
     def sync_winsize(*_ignored) -> None:
         try:
@@ -573,8 +556,9 @@ def run_pty_capture(argv: List[str]) -> str:
                 if data:
                     os.write(master_fd, data)
             try:
-                done, _status = os.waitpid(pid, os.WNOHANG)
+                done, status = os.waitpid(pid, os.WNOHANG)
                 if done == pid:
+                    status_code = exit_code(status)
                     break
             except ChildProcessError:
                 break
@@ -587,11 +571,13 @@ def run_pty_capture(argv: List[str]) -> str:
         except OSError:
             pass
         try:
-            os.waitpid(pid, 0)
+            done, status = os.waitpid(pid, 0)
+            if done == pid:
+                status_code = exit_code(status)
         except ChildProcessError:
             pass
 
-    return captured.decode(errors="replace")
+    return captured.decode(errors="replace"), status_code
 
 
 def launch_program(stdscr, state: State, command: List[str] | None = None) -> None:
@@ -601,7 +587,10 @@ def launch_program(stdscr, state: State, command: List[str] | None = None) -> No
         s = prompt(stdscr, "Command", "")
         if not s:
             return
-        state.command = shlex.split(s)
+        parsed = parse_command(s)
+        if parsed is None:
+            return
+        state.command = parsed
         command_to_run = state.command
     argv, profile = state.launch_argv(command_to_run)
     curses.def_prog_mode()
@@ -611,8 +600,10 @@ def launch_program(stdscr, state: State, command: List[str] | None = None) -> No
     except curses.error:
         pass
     print(f"\n$ {shell_join(argv)}\n")
+    output = ""
+    status = 1
     try:
-        output = run_pty_capture(argv)
+        output, status = run_pty_capture(argv)
         detected = detect_resume_command(output)
         if detected:
             LAST_RESUME_COMMAND = detected
@@ -622,113 +613,568 @@ def launch_program(stdscr, state: State, command: List[str] | None = None) -> No
             except OSError: pass
         curses.reset_prog_mode()
         stdscr.refresh()
+    if status != 0:
+        show_text(stdscr, "command failed", f"Command exited with status {status}.\n\n" + (output or "(no output captured)"))
 
 
-def activate_main_choice(stdscr, state: State, choice: str) -> bool:
-    """Run one main-menu action. Return True when the menu should exit."""
-    if choice == "resume" and LAST_RESUME_COMMAND:
+
+DEV_CACHE_PATHS = [
+    "~/.cache", "~/.npm", "~/.cargo", "~/.rustup", "~/.local/share/pnpm", "~/.pi",
+    "~/.bun", "~/.cache/bun", "~/.deno", "~/.mix", "~/.hex", "~/go",
+    "~/.cache/go-build", "~/.m2", "~/.gradle", "~/.cache/pip", "~/.cache/uv",
+]
+DEFAULT_ENV_VARS = ["HOME", "PATH", "SHELL", "USER", "LOGNAME", "TMPDIR", "PWD"]
+TABS = ["Run", "Network", "Paths", "Environment", "Features"]
+
+DEFAULT_PATH_CATEGORIES = [
+    ("Temp directories", "rw", ["/tmp", "/var/folders"]),
+    ("Developer caches", "rw", DEV_CACHE_PATHS),
+    ("System runtime", "ro", ["/bin", "/sbin", "/usr", "/System", "/Library", "/opt"]),
+    ("Git config", "ro", ["~/.gitconfig", "~/.config/git"]),
+    ("Home ancestors", "meta", []),
+]
+
+ACCESS_CYCLE = ["ro", "rw", "deny", "off"]
+DEFAULT_CYCLE = ["default", "ro", "rw", "deny", "off"]
+
+@dataclass
+class Row:
+    key: str
+    text: str = ""
+    detail: str = ""
+    selectable: bool = True
+    tag: str = ""
+    attr: int = 0
+    indent: int = 0
+
+
+def effective_workdir(state: State) -> str:
+    return state.workdir or str(Path.cwd())
+
+
+def home_ancestors() -> List[str]:
+    home = Path.home()
+    return [str(home.parent), str(home)]
+
+
+def category_paths(name: str) -> List[str]:
+    if name == "Home ancestors":
+        return home_ancestors()
+    for cat, _mode, paths in DEFAULT_PATH_CATEGORIES:
+        if cat == name:
+            return paths
+    return []
+
+
+def paths_for_override(state: State, name: str) -> List[str]:
+    if name == "Workdir":
+        return [effective_workdir(state)]
+    if name.startswith(("/", "~")):
+        return [name]
+    return category_paths(name)
+
+
+def override_allow_paths(state: State) -> tuple[List[str], List[str]]:
+    ro: List[str] = []
+    rw: List[str] = []
+    for name, mode in state.path_overrides.items():
+        paths = paths_for_override(state, name)
+        if mode == "ro":
+            ro.extend(paths)
+        elif mode == "rw":
+            rw.extend(paths)
+    return unique(ro), unique(rw)
+
+
+def default_mode(path_or_category: str) -> str:
+    if path_or_category == "Workdir":
+        return "rw"
+    if path_or_category == str(CONFIG_PATH):
+        return "deny"
+    for name, mode, paths in DEFAULT_PATH_CATEGORIES:
+        if path_or_category == name or path_or_category in paths:
+            return mode
+    return "off"
+
+
+def current_default_mode(state: State, path_or_category: str) -> str:
+    return state.path_overrides.get(path_or_category, default_mode(path_or_category))
+
+
+def tag(mode: str) -> str:
+    return f"[{mode}]" if mode not in {"default", "off"} else f"[{mode}]"
+
+
+def path_mode(state: State, path: str) -> str:
+    if path in state.rw_paths:
+        return "rw"
+    if path in state.ro_paths:
+        return "ro"
+    if path in state.deny_paths:
+        return "deny"
+    return "off"
+
+
+def set_path_mode(state: State, path: str, mode: str) -> None:
+    if path not in state.paths:
+        state.paths.append(path)
+    for xs in (state.ro_paths, state.rw_paths, state.deny_paths):
+        while path in xs:
+            xs.remove(path)
+    if mode == "ro":
+        state.ro_paths.append(path)
+    elif mode == "rw":
+        state.rw_paths.append(path)
+    elif mode == "deny":
+        state.deny_paths.append(path)
+
+
+def cycle_user_path(state: State, path: str) -> None:
+    mode = path_mode(state, path)
+    set_path_mode(state, path, ACCESS_CYCLE[(ACCESS_CYCLE.index(mode) + 1) % len(ACCESS_CYCLE)])
+
+
+def cycle_default(state: State, name: str) -> None:
+    mode = state.path_overrides.get(name, "default")
+    nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(mode) + 1) % len(DEFAULT_CYCLE)]
+    if nxt == "default":
+        state.path_overrides.pop(name, None)
+    else:
+        state.path_overrides[name] = nxt
+
+
+def cycle_category(state: State, name: str) -> None:
+    paths = category_paths(name)
+    mode = state.path_overrides.get(name, "default")
+    nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(mode) + 1) % len(DEFAULT_CYCLE)]
+    if nxt == "default":
+        state.path_overrides.pop(name, None)
+        for p in paths:
+            state.path_overrides.pop(p, None)
+    else:
+        state.path_overrides[name] = nxt
+        for p in paths:
+            state.path_overrides[p] = nxt
+
+
+def mode_attr(mode: str) -> int:
+    return {
+        "rw": color(CP_GOOD, curses.A_BOLD),
+        "ro": color(CP_ACCENT),
+        "meta": color(CP_MUTED),
+        "deny": color(CP_BAD, curses.A_BOLD),
+        "off": color(CP_MUTED),
+        "change": color(CP_WARN),
+        "pass": color(CP_GOOD),
+        "file": color(CP_ACCENT),
+        "missing": color(CP_BAD),
+        "all": color(CP_WARN),
+    }.get(mode.strip("[]"), 0)
+
+
+def env_value(name: str) -> tuple[str, str]:
+    return ("pass", os.environ.get(name, "")) if name in os.environ else ("missing", "not set in parent environment")
+
+
+def sourced_env(state: State) -> dict[str, str]:
+    if not (state.env_file_enabled and state.env_file):
+        return {}
+    script = 'set -a; source "$1"; env -0'
+    base = {name: os.environ.get(name, "") for name in DEFAULT_ENV_VARS if name in os.environ}
+    try:
+        p = subprocess.run(["/bin/bash", "-c", script, "bash", os.path.expanduser(state.env_file)],
+                           env=base, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return {}
+    result: dict[str, str] = {}
+    for item in p.stdout.decode(errors="replace").split("\0"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            result[k] = v
+    return {k: v for k, v in result.items() if base.get(k) != v or k not in base}
+
+
+def changes_rows(state: State, rows: List[Row], scope: str) -> None:
+    changes: List[str] = []
+    if scope == "network":
+        if not state.network:
+            changes.append("+ DENY network*")
+        if state.docker_socket:
+            changes.append("+ ALLOW Docker socket access")
+        if state.podman_socket:
+            changes.append("+ ALLOW Podman socket access")
+        if state.ssh_agent_socket:
+            changes.append("+ ALLOW SSH agent socket access")
+    elif scope == "paths":
+        for p in unique(state.rw_paths + state.ro_paths + state.deny_paths):
+            changes.append(f"+ {path_mode(state, p).upper()} {p}")
+        for p, m in state.path_overrides.items():
+            if m != default_mode(p):
+                changes.append(f"{p}: {default_mode(p).upper()} → {m.upper()}")
+    elif scope == "features":
+        for f in state.enabled:
+            changes.append(f"+ ENABLE {f}")
+    if changes:
+        rows.append(Row("heading", "Changes from default", selectable=False))
+        rows.extend(Row("info", c, tag="change", selectable=False) for c in changes)
+
+
+def rows_for(state: State, tab: str, dirty: bool) -> List[Row]:
+    rows: List[Row] = []
+    if tab == "Run":
+        rows += [Row("heading", "Command", selectable=False), Row("info", shell_join(state.command) or "(none)", selectable=False)]
+        rows.append(Row("heading", "Actions", selectable=False))
+        if LAST_RESUME_COMMAND:
+            rows += [Row("resume", "Resume detected session", shell_join(LAST_RESUME_COMMAND), tag="resume")]
+        rows += [
+            Row("run", "Run / Restart command", tag="run"),
+            Row("edit_command", "Edit command", tag="edit"),
+            Row("export", "Write generated policy to file", tag="export"),
+            Row("save", "Save and Quit" + (" *" if dirty else ""), tag="save"),
+            Row("discard", "Discard and Quit", tag="discard"),
+            Row("heading", "Generated sandbox command", selectable=False),
+            Row("info", generated_command_line(state), selectable=False),
+        ]
+        return rows
+
+    if tab == "Network":
+        rows.append(Row("heading", "Network controls", selectable=False))
+        rows += [
+            Row("network", "Allow network traffic", tag="x" if state.network else " "),
+            Row("docker_socket", "Allow Docker socket access", "/var/run/docker.sock\n~/.docker/run/docker.sock", tag="x" if state.docker_socket else " "),
+            Row("podman_socket", "Allow Podman socket access", "/run/podman/podman.sock\n~/.local/share/containers/podman/machine/podman.sock", tag="x" if state.podman_socket else " "),
+            Row("ssh_agent_socket", "Allow SSH agent socket access", "SSH_AUTH_SOCK", tag="x" if state.ssh_agent_socket else " "),
+        ]
+        changes_rows(state, rows, "network")
+        return rows
+
+    if tab == "Paths":
+        rows.append(Row("heading", "User path rules", selectable=False))
+        rows.append(Row("add_path", "Add path rule", tag="add"))
+        custom = sorted(set(state.paths + state.ro_paths + state.rw_paths + state.deny_paths))
+        if custom:
+            rows += [Row("path:" + p, p, tag=path_mode(state, p)) for p in custom]
+        rows.append(Row("heading", "Default writable paths", selectable=False))
+        rows.append(Row("default:Workdir", "Workdir", effective_workdir(state), tag=current_default_mode(state, "Workdir")))
+        for name, mode, paths in DEFAULT_PATH_CATEGORIES:
+            if mode == "rw":
+                add_category_rows(state, rows, name)
+        rows.append(Row("heading", "Default read-only paths", selectable=False))
+        for name, mode, paths in DEFAULT_PATH_CATEGORIES:
+            if mode == "ro":
+                add_category_rows(state, rows, name)
+        rows.append(Row("heading", "Default metadata-only paths", selectable=False))
+        add_category_rows(state, rows, "Home ancestors")
+        rows.append(Row("heading", "Default denied paths", selectable=False))
+        rows.append(Row("default:" + str(CONFIG_PATH), "Project sandbox config", str(CONFIG_PATH), tag=current_default_mode(state, str(CONFIG_PATH))))
+        changes_rows(state, rows, "paths")
+        return rows
+
+    if tab == "Environment":
+        rows.append(Row("heading", "Environment mode", selectable=False))
+        rows.append(Row("env_full", "Pass full environment", tag="x" if state.env_mode == "full" else " "))
+        rows.append(Row("env_file", "Load trusted environment file (sourced by bash)", state.env_file, tag="x" if state.env_file_enabled and state.env_file else " "))
+        rows.append(Row("heading", "Extra env-pass variables", selectable=False))
+        if state.env_mode == "full":
+            rows.append(Row("info", "Ignored while full environment is enabled", tag="info", selectable=False))
+        else:
+            rows.append(Row("add_env", "Add variable", tag="add"))
+            rows += [Row("env_pass:" + name, name, env_value(name)[1], tag=env_value(name)[0]) for name in state.env_pass]
+        rows.append(Row("heading", "Passed variables", selectable=False))
+        if state.env_mode == "full":
+            rows.append(Row("info", "Full parent environment will be passed to the command", tag="all", selectable=False))
+            rows.append(Row("heading", "Preview", selectable=False))
+            for name in list(os.environ)[:12]:
+                rows.append(Row("info", name, os.environ.get(name, ""), tag="env", selectable=False))
+            rows.append(Row("info", "...", "more variables not shown", tag="env", selectable=False))
+        else:
+            for name in DEFAULT_ENV_VARS:
+                rows.append(Row("info", name, os.environ.get(name, ""), tag="pass", selectable=False))
+            for name, value in sourced_env(state).items():
+                if name not in DEFAULT_ENV_VARS:
+                    rows.append(Row("info", name, value, tag="file", selectable=False))
+        return rows
+
+    rows = []
+    for heading, entries in FEATURE_GROUPS:
+        rows.append(Row("heading", heading, selectable=False))
+        for label, feature in entries:
+            rows.append(Row("feature:" + feature, label, tag="x" if feature in state.enabled else " "))
+    changes_rows(state, rows, "features")
+    return rows
+
+
+def add_category_rows(state: State, rows: List[Row], name: str) -> None:
+    rows.append(Row("category:" + name, name, tag=current_default_mode(state, name)))
+    if name in state.expanded_path_categories:
+        for p in category_paths(name):
+            rows.append(Row("default:" + p, p, tag=current_default_mode(state, p), indent=2))
+
+
+def generated_command_line(state: State) -> str:
+    # The live runner uses a temporary append-profile for safehouse+ rules
+    # (network denies, socket grants, config-file protection).  The UI shows a
+    # stable placeholder instead of a path that would be deleted after redraw.
+    argv = [SAFEHOUSE] + state.safehouse_args("<generated-profile>") + ["--"] + state.command
+    return shell_join(argv)
+
+
+def selectable_indices(rows: List[Row]) -> List[int]:
+    return [i for i, row in enumerate(rows) if row.selectable]
+
+
+def clamp_selection(rows: List[Row], idx: int) -> int:
+    choices = selectable_indices(rows)
+    if not choices:
+        return 0
+    if idx in choices:
+        return idx
+    return min(choices, key=lambda i: abs(i - idx))
+
+
+def move_selection(rows: List[Row], idx: int, delta: int) -> int:
+    choices = selectable_indices(rows)
+    if not choices:
+        return 0
+    pos = choices.index(clamp_selection(rows, idx))
+    return choices[max(0, min(len(choices) - 1, pos + delta))]
+
+
+def export_policy(stdscr, state: State) -> None:
+    path = prompt(stdscr, "Export policy to", "safehouse.sb", complete_path=True)
+    if not path:
+        return
+    profile = state.make_append_profile()
+    try:
+        args = [SAFEHOUSE] + state.safehouse_args(profile) + [f"--output={os.path.expanduser(path)}"]
+        show_text(stdscr, "export policy", run_capture(args) or f"Wrote {path}")
+    finally:
+        if profile:
+            try: os.unlink(profile)
+            except OSError: pass
+
+
+def activate_row(stdscr, state: State, row: Row) -> bool:
+    key = row.key
+    if key == "resume" and LAST_RESUME_COMMAND:
         launch_program(stdscr, state, LAST_RESUME_COMMAND)
-    elif choice == "run":
+    elif key == "run":
         launch_program(stdscr, state)
-    elif choice == "edit_command":
+    elif key == "edit_command":
         s = prompt(stdscr, "Command", shell_join(state.command))
         if s is not None:
-            state.command = shlex.split(s) if s else []
-    elif choice == "features":
-        choose_feature(stdscr, state)
-    elif choice == "network":
-        state.network = not state.network
-    elif choice == "paths":
-        edit_paths(stdscr, state)
-    elif choice == "workdir":
-        s = prompt(stdscr, "Workdir (empty = safehouse default)", state.workdir, complete_path=True)
+            parsed = parse_command(s)
+            if parsed is not None:
+                state.command = parsed
+    elif key == "export":
+        export_policy(stdscr, state)
+    elif key == "save":
+        state.save(); return True
+    elif key == "discard":
+        return True
+    elif key in {"network", "docker_socket", "podman_socket", "ssh_agent_socket"}:
+        setattr(state, {"network":"network", "docker_socket":"docker_socket", "podman_socket":"podman_socket", "ssh_agent_socket":"ssh_agent_socket"}[key], not getattr(state, key))
+    elif key == "add_path":
+        s = prompt(stdscr, "Add path rule", "", complete_path=True)
+        if s:
+            set_path_mode(state, s, "rw")
+    elif key.startswith("path:"):
+        cycle_user_path(state, key[5:])
+    elif key.startswith("category:"):
+        name = key[9:]
+        if name in state.expanded_path_categories:
+            state.expanded_path_categories.remove(name)
+        else:
+            state.expanded_path_categories.append(name)
+    elif key.startswith("default:"):
+        cycle_default(state, key[8:])
+    elif key == "env_full":
+        state.env_mode = "sanitized" if state.env_mode == "full" else "full"
+    elif key == "env_file":
+        s = prompt(stdscr, "Trusted env file", state.env_file, complete_path=True)
         if s is not None:
-            state.workdir = s
-    elif choice == "env":
-        state.env_mode = "full" if state.env_mode != "full" else "sanitized"
-    elif choice == "env_pass":
-        edit_list(stdscr, "env-pass names", state.env_pass)
-    elif choice == "command":
-        argv, profile = state.launch_argv()
-        show_text(stdscr, "safehouse command", shell_join(argv) + (f"\n\nappend profile: {profile}" if profile else ""))
-        if profile:
-            try:
-                os.unlink(profile)
-            except OSError:
-                pass
-    elif choice == "explain":
-        prof = state.make_append_profile()
-        show_text(stdscr, "explain", run_capture([SAFEHOUSE] + state.safehouse_args(prof) + ["--explain"]))
-        if prof:
-            try:
-                os.unlink(prof)
-            except OSError:
-                pass
-    elif choice == "save":
-        state.save()
-        return True
-    elif choice == "discard":
-        return True
+            state.env_file = s
+            state.env_file_enabled = bool(s)
+    elif key == "add_env":
+        s = prompt(stdscr, "Environment variable name", "")
+        if s and s not in state.env_pass:
+            state.env_pass.append(s)
+    elif key.startswith("env_pass:"):
+        old = key[9:]
+        s = prompt(stdscr, "Environment variable name", old)
+        if s:
+            state.env_pass[state.env_pass.index(old)] = s
+    elif key.startswith("feature:"):
+        f = key[8:]
+        if f in state.enabled:
+            state.enabled.remove(f)
+        else:
+            state.enabled.append(f); state.enabled.sort()
     return False
 
 
+def delete_or_reset(state: State, row: Row) -> bool:
+    key = row.key
+    if key == "discard":
+        return True
+    if key == "env_full":
+        state.env_mode = "sanitized"
+    elif key == "env_file":
+        state.env_file = ""
+        state.env_file_enabled = False
+    elif key.startswith("env_pass:"):
+        name = key[9:]
+        if name in state.env_pass:
+            state.env_pass.remove(name)
+    elif key.startswith("path:"):
+        path = key[5:]
+        set_path_mode(state, path, "off")
+        while path in state.paths:
+            state.paths.remove(path)
+    elif key.startswith("default:"):
+        state.path_overrides.pop(key[8:], None)
+    elif key.startswith("category:"):
+        name = key[9:]
+        state.path_overrides.pop(name, None)
+        for p in category_paths(name):
+            state.path_overrides.pop(p, None)
+    return False
+
+
+def draw_tabs(stdscr, active: int) -> None:
+    addstr(stdscr, 0, 0, "safehouse+", color(CP_TITLE, curses.A_BOLD))
+    x = 1
+    for i, name in enumerate(TABS):
+        y = 2
+        text = f" {name} "
+        attr = color(CP_SELECTED if i == active else CP_TITLE, curses.A_BOLD if i == active else 0)
+        addstr(stdscr, y, x, text, attr)
+        x += len(text) + 2
+    addstr(stdscr, 3, 0, "─" * max(0, curses.COLS - 1), color(CP_MUTED))
+
+
+def wrapped_lines(text: str, width: int) -> List[str]:
+    if width <= 1:
+        return [text]
+    lines: List[str] = []
+    for part in text.splitlines() or [""]:
+        lines.extend(textwrap.wrap(part, width=width, break_long_words=False, break_on_hyphens=False) or [""])
+    return lines
+
+
+def draw_rows(stdscr, rows: List[Row], idx: int, top: int) -> None:
+    y = 5
+    max_y = curses.LINES - 2
+    for n, row in enumerate(rows[top:], start=top):
+        if y >= max_y:
+            break
+        if row.key == "heading":
+            addstr(stdscr, y, 0, row.text, color(CP_TITLE, curses.A_BOLD)); y += 1; continue
+        selected = n == idx
+        prefix_attr = color(CP_SELECTED) if selected else 0
+        addstr(stdscr, y, 0, "> " if selected else "  ", prefix_attr)
+        x = 2 + row.indent
+        if row.tag:
+            display_tag = f"[{row.tag}]" if len(row.tag) == 1 else f"[{row.tag}]"
+            addstr(stdscr, y, x, display_tag, mode_attr(row.tag)); x += len(display_tag) + 1
+        text_attr = (color(CP_TITLE, curses.A_BOLD) if selected else row.attr)
+        if row.key == "info":
+            text_attr |= color(CP_MUTED)
+
+        text_width = max(1, curses.COLS - x - 1)
+        text_lines = wrapped_lines(row.text, text_width)
+        addstr(stdscr, y, x, text_lines[0], text_attr)
+        for extra in text_lines[1:]:
+            y += 1
+            if y >= max_y: break
+            addstr(stdscr, y, x, extra, text_attr)
+
+        if row.detail and y < max_y:
+            details = row.detail.splitlines()
+            first_x = min(max(32, x + min(len(text_lines[-1]), 28) + 2), max(2, curses.COLS - 30))
+            for i, d in enumerate(details):
+                if i > 0 or text_lines:
+                    y += 1
+                    if y >= max_y: break
+                for j, line in enumerate(wrapped_lines(d, max(1, curses.COLS - first_x - 1))):
+                    if j > 0:
+                        y += 1
+                        if y >= max_y: break
+                    addstr(stdscr, y, first_x, line, color(CP_MUTED))
+        y += 1
+
+
+def footer_for(tab: str, row: Row) -> str:
+    if tab == "Run":
+        return "Enter/Space activate · ←/→ switch tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save · D discard"
+    if tab == "Network":
+        return "Enter/Space toggle · ←/→ switch tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save · D discard"
+    if tab == "Paths":
+        if row.key.startswith("category:"):
+            return "Space cycle · Enter expand/collapse · D reset · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save"
+        return "Space cycle · Enter expand/edit · D delete/reset · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save"
+    if tab == "Environment" and row.key == "info":
+        return "Read-only · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save"
+    if tab == "Environment":
+        return "Space toggle · Enter edit/add · D delete/reset · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save"
+    return "Space/Enter toggle · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save"
+
+
 def main_ui(stdscr, state: State, original: State | None = None) -> None:
-    init_colors()
-    curses.curs_set(0)
-    idx = 0
+    init_colors(); curses.curs_set(0); stdscr.keypad(True)
+    active = 0
+    idx_by_tab = {tab: 0 for tab in TABS}
+    top_by_tab = {tab: 0 for tab in TABS}
     original_snapshot = asdict(original or copy.deepcopy(state))
     while True:
-        cmd = shell_join(state.command) if state.command else "(none)"
+        tab = TABS[active]
         dirty = asdict(state) != original_snapshot
-        menu = [
-            ("run", "Run / restart program", cmd),
-            ("edit_command", "Edit program command", cmd),
-            ("features", "Toggle optional features", f"{len(state.enabled)} enabled"),
-            ("network", f"[{'x' if state.network else ' '}] Network access", ""),
-            ("paths", "Edit path rules", f"ro/rw/deny: {len(state.ro_paths)}/{len(state.rw_paths)}/{len(state.deny_paths)}"),
-            ("workdir", "Edit workdir", state.workdir or f"(default: {Path.cwd()})"),
-            ("env", f"[{'x' if state.env_mode == 'full' else ' '}] Full environment", ""),
-            ("env_pass", "Edit env-pass variables", ",".join(state.env_pass) or "(none)"),
-            ("command", "View generated safehouse command", ""),
-            ("explain", "View safehouse --explain", ""),
-            ("save", "Save and Quit (q/Ctrl-C)" + (" *" if dirty else ""), ""),
-            ("discard", "Discard and Quit", ""),
-        ]
-        if LAST_RESUME_COMMAND:
-            menu.insert(0, ("resume", "Resume detected session", shell_join(LAST_RESUME_COMMAND)))
-        idx = min(idx, len(menu) - 1)
-        stdscr.erase()
-        addstr(stdscr, 0, 0, "safehouse+", color(CP_TITLE, curses.A_BOLD))
-        for i, (key, label, side) in enumerate(menu):
-            attr = color(CP_SELECTED) if i == idx else 0
-            label_attr = attr
-            if key == "discard":
-                label_attr |= color(CP_BAD) if i != idx else 0
-            elif key == "save" and dirty:
-                label_attr |= color(CP_GOOD, curses.A_BOLD) if i != idx else curses.A_BOLD
-            elif key in ("network", "env"):
-                label_attr |= color(CP_GOOD) if "[x]" in label and i != idx else 0
-            prefix = "> " if i == idx else "  "
-            y = i + 2
-            addstr(stdscr, y, 0, prefix, attr)
-            addstr(stdscr, y, 2, label, label_attr)
-            if side:
-                side_x = 32 if curses.COLS >= 90 else 24
-                addstr(stdscr, y, side_x, side, color(CP_ACCENT) if key in ("run", "edit_command", "resume") else color(CP_MUTED))
-        ch = safe_getch(stdscr)
-        if ch in (3, ord('q'), 27):
-            state.save(); return
-        if ch == ord('r') and LAST_RESUME_COMMAND:
-            if activate_main_choice(stdscr, state, "resume"):
-                return
-        elif ch in (curses.KEY_UP, ord('k'), 16):
-            idx = max(0, idx - 1)
-        elif ch in (curses.KEY_DOWN, ord('j'), 14):
-            idx = min(len(menu) - 1, idx + 1)
-        elif is_activate_key(ch):
-            if activate_main_choice(stdscr, state, menu[idx][0]):
-                return
+        rows = rows_for(state, tab, dirty)
+        idx = clamp_selection(rows, idx_by_tab[tab])
+        idx_by_tab[tab] = idx
+        height = max(1, curses.LINES - 8)
+        top = min(top_by_tab[tab], max(0, len(rows) - height))
+        if idx < top: top = idx
+        if idx >= top + height: top = idx - height + 1
+        top_by_tab[tab] = top
 
+        stdscr.erase()
+        draw_tabs(stdscr, active)
+        draw_rows(stdscr, rows, idx, top)
+        addstr(stdscr, curses.LINES - 2, 0, "─" * max(0, curses.COLS - 1), color(CP_MUTED))
+        addstr(stdscr, curses.LINES - 1, 0, footer_for(tab, rows[idx]), color(CP_MUTED))
+        stdscr.refresh()
+
+        ch = safe_getch(stdscr)
+        if ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            stdscr.clear()
+            continue
+        if ch in (3, ord('q')):
+            state.save(); return
+        if ch == ord('D'):
+            if tab == "Run" or delete_or_reset(state, rows[idx]): return
+        elif ch in (curses.KEY_RIGHT,):
+            active = (active + 1) % len(TABS)
+        elif ch in (curses.KEY_LEFT,):
+            active = (active - 1) % len(TABS)
+        elif ch in (9,):
+            active = (active + 1) % len(TABS)
+        elif ch in (curses.KEY_UP, ord('k'), 16):
+            idx_by_tab[tab] = move_selection(rows, idx, -1)
+        elif ch in (curses.KEY_DOWN, ord('j'), 14):
+            idx_by_tab[tab] = move_selection(rows, idx, 1)
+        elif ch == ord(' ') and rows[idx].key.startswith("category:"):
+            cycle_category(state, rows[idx].key[9:])
+        elif ch == ord(' ') and rows[idx].key == "env_file":
+            if state.env_file:
+                state.env_file_enabled = not state.env_file_enabled
+            else:
+                activate_row(stdscr, state, rows[idx])
+        elif ch in ENTER_KEYS and rows[idx].key.startswith("category:"):
+            activate_row(stdscr, state, rows[idx])
+        elif is_activate_key(ch):
+            if activate_row(stdscr, state, rows[idx]): return
 
 def first_run_ui(stdscr, state: State, original: State) -> None:
     launch_program(stdscr, state)
