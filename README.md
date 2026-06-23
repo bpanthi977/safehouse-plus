@@ -1,87 +1,39 @@
 # safehouse+
 
-`safehouse+` is a small terminal UI wrapper around [`safehouse`](https://agent-safehouse.dev) for iterating on sandbox settings without remembering command-line flags.
+`safehouse+` is a terminal UI for running commands through [`safehouse`](https://agent-safehouse.dev). It helps you tune sandbox permissions, restart quickly, and see/export the generated `safehouse` policy without memorizing flags.
 
-It does **not** modify `safehouse`; it builds and runs `safehouse` commands for you.
+It does not modify `safehouse`; it builds and runs `safehouse` commands for you.
 
 ## Usage
 
-Run a command immediately:
+Run a command in the sandbox:
 
 ```bash
 safehouse+ pi
 ```
 
-Open the menu first:
+Open the UI before running:
 
 ```bash
 safehouse+ --menu pi
 ```
 
-Open the menu with the last saved command/settings:
+Open the UI with the last saved command and settings:
 
 ```bash
 safehouse+
 ```
 
-Settings are saved per-folder in:
+Settings are saved per folder in `.safehouse-plus.json`.
 
-```text
-.safehouse-plus.json
-```
+## What you can configure
 
-## What you can change
+The UI is organized into tabs:
 
-From the menu you can:
+- **Run** — run/restart, edit the command, resume a detected session, save/discard, or export the generated policy.
+- **Network** — allow/deny network traffic and sensitive sockets such as Docker, Podman, and SSH agent sockets.
+- **Paths** — add custom `ro`, `rw`, or `deny` path rules and override default path groups.
+- **Environment** — use the default sanitized environment, pass selected variables, pass the full environment, or load a trusted env file sourced by bash.
+- **Features** — enable optional safehouse integrations such as Docker, SSH, VS Code, cloud credentials, browsers, GUI access, and broad presets.
 
-- run/restart the current command
-- edit the command before restarting
-- toggle Safehouse optional features
-- toggle network access
-- edit path rules in one list (`ro`, `rw`, `deny`, or off)
-- set the Safehouse workdir
-- toggle full environment passthrough
-- pass selected environment variables
-- view the generated `safehouse` command
-- view `safehouse --explain`
-
-## Resume commands
-
-If a tool prints a resume hint like:
-
-```text
-To resume this session: pi --session ...
-```
-
-`safehouse+` detects it for the current run and adds a temporary menu item:
-
-```text
-Resume detected session: ...
-```
-
-Press `r` to resume quickly. Resume commands are **not** saved to disk.
-
-## Keys
-
-Main/menu navigation:
-
-- `Ctrl-n` / Down / `j` — move down
-- `Ctrl-p` / Up / `k` — move up
-- `Enter` — select
-- `q` or `Ctrl-c` — save and quit from main menu
-- `Ctrl-c` — return from submenus
-
-Text input:
-
-- `Ctrl-a` — start of line
-- `Ctrl-e` — end of line
-- `Ctrl-b` / `Ctrl-f` — back/forward one character
-- `Alt-b` / `Alt-f` or `Esc b` / `Esc f` — back/forward one word
-- `Ctrl-w` — delete previous word
-- `Ctrl-k` — delete to end
-- `Ctrl-u` — delete before cursor
-- `Esc` — cancel input
-
-## Notes
-
-Because macOS sandbox profiles are applied when a process starts, changing settings requires restarting the sandboxed program. `safehouse+` is designed to make that restart loop fast.
+Because sandbox profiles are applied when a process starts, changing settings requires restarting the command. `safehouse+` is designed to make that loop fast.
