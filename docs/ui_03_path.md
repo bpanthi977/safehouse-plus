@@ -16,7 +16,6 @@ safehouse+
 
 User path rules
 > [add] Add path rule
-  [info] No custom path rules
 
 Default writable paths
   [rw] Workdir
@@ -34,8 +33,6 @@ Default metadata-only paths
 Default denied paths
   [deny] Project sandbox config
          /Users/bpanthi977/Dev/safehouse-plus/.safehouse-plus.json
-  [deny] Sensitive sockets and private system paths
-         Managed by Network and sandbox defaults
 
 ────────────────────────────────────────────
 Space cycle · Enter expand/edit · D delete/reset · ←/→ tabs · Ctrl-p/Ctrl-n move · q/Ctrl-C save
@@ -88,7 +85,6 @@ safehouse+
 
 User path rules
   [add] Add path rule
-  [info] No custom path rules
 
 Default writable paths
   [rw] Workdir
@@ -125,7 +121,6 @@ safehouse+
 
 User path rules
   [add] Add path rule
-  [info] No custom path rules
 
 Default writable paths
   [rw] Workdir
@@ -164,7 +159,6 @@ safehouse+
 
 User path rules
   [add] Add path rule
-  [info] No custom path rules
 
 Default writable paths
   [rw] Workdir
@@ -232,7 +226,7 @@ Default rows should keep showing their current effective state in the tag:
 [meta] default metadata-only
 ```
 
-When a default row is overridden, it appears in `Changes from default`. Pressing `D` on that row removes the override and restores the default state.
+When a default row is overridden to a state different from its default, it appears in `Changes from default`. Pressing `D` on that row removes the override and restores the default state.
 
 When a user rule reaches `[off]`, it stays visible in `User path rules`. It is removed only by pressing `D`.
 
@@ -259,7 +253,7 @@ When a user rule reaches `[off]`, it stays visible in `User path rules`. It is r
 
 - The old `Path controls` section is removed.
 - `Workdir` is shown inside `Default writable paths`.
-- The project sandbox config file, `<workdir>/.safehouse-plus.json`, is denied by default even though the workdir is writable. This prevents the sandboxed command from modifying future sandbox settings.
+- The project sandbox config file, `<workdir>/.safehouse-plus.json`, is denied by default even though the workdir is writable. This prevents the sandboxed command from modifying future sandbox settings. It is still shown as an editable default path row so the user can explicitly override it.
 - `[add] Add path rule` belongs inside `User path rules`.
 - `[add] Add path rule` opens a path input with Tab completion.
 - No repeated `Press Enter to expand` helper text is shown on category rows; the footer explains the controls.
