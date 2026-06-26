@@ -155,8 +155,16 @@ def split_colon(paths: List[str]) -> str:
     return ":".join(p for p in paths if p)
 
 
+def canonical_path(s: str) -> str:
+    # The macOS sandbox matches against symlink-resolved paths, so safehouse
+    # grants its rules on the canonical backing paths (e.g. /private/tmp for
+    # /tmp, /private/var/folders for /var/folders).  Our generated deny/allow
+    # rules must use the same canonical form or they silently fail to match.
+    return os.path.realpath(os.path.expanduser(s))
+
+
 def sb_quote(s: str) -> str:
-    return json.dumps(os.path.expanduser(s))
+    return json.dumps(canonical_path(s))
 
 
 def unique(xs: List[str]) -> List[str]:
@@ -170,8 +178,8 @@ def unique(xs: List[str]) -> List[str]:
 
 
 def sandbox_path_clause(path: str) -> str:
-    expanded = os.path.expanduser(path)
-    kind = "subpath" if path.endswith("/") or os.path.isdir(expanded) else "literal"
+    real = canonical_path(path)
+    kind = "subpath" if path.endswith("/") or os.path.isdir(real) else "literal"
     return f"    ({kind} {sb_quote(path)})"
 
 
@@ -666,6 +674,16 @@ def category_paths(name: str) -> List[str]:
     return []
 
 
+def category_of(path: str) -> str | None:
+    """Return the default category a path belongs to, or None."""
+    if path in home_ancestors():
+        return "Home ancestors"
+    for name, _mode, paths in DEFAULT_PATH_CATEGORIES:
+        if path in paths:
+            return name
+    return None
+
+
 def paths_for_override(state: State, name: str) -> List[str]:
     if name == "Workdir":
         return [effective_workdir(state)]
@@ -691,6 +709,8 @@ def default_mode(path_or_category: str) -> str:
         return "rw"
     if path_or_category == str(CONFIG_PATH):
         return "deny"
+    if path_or_category == "Home ancestors" or path_or_category in home_ancestors():
+        return "meta"
     for name, mode, paths in DEFAULT_PATH_CATEGORIES:
         if path_or_category == name or path_or_category in paths:
             return mode
@@ -734,9 +754,18 @@ def cycle_user_path(state: State, path: str) -> None:
     set_path_mode(state, path, ACCESS_CYCLE[(ACCESS_CYCLE.index(mode) + 1) % len(ACCESS_CYCLE)])
 
 
+def next_default_mode(current: str, name: str) -> str:
+    nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(current) + 1) % len(DEFAULT_CYCLE)]
+    # An explicit mode that equals the row's default is visually identical to
+    # "default" (no override), so skip it to avoid a no-op Space press.
+    if nxt != "default" and nxt == default_mode(name):
+        nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(nxt) + 1) % len(DEFAULT_CYCLE)]
+    return nxt
+
+
 def cycle_default(state: State, name: str) -> None:
     mode = state.path_overrides.get(name, "default")
-    nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(mode) + 1) % len(DEFAULT_CYCLE)]
+    nxt = next_default_mode(mode, name)
     if nxt == "default":
         state.path_overrides.pop(name, None)
     else:
@@ -746,7 +775,7 @@ def cycle_default(state: State, name: str) -> None:
 def cycle_category(state: State, name: str) -> None:
     paths = category_paths(name)
     mode = state.path_overrides.get(name, "default")
-    nxt = DEFAULT_CYCLE[(DEFAULT_CYCLE.index(mode) + 1) % len(DEFAULT_CYCLE)]
+    nxt = next_default_mode(mode, name)
     if nxt == "default":
         state.path_overrides.pop(name, None)
         for p in paths:
@@ -776,13 +805,27 @@ def env_value(name: str) -> tuple[str, str]:
     return ("pass", os.environ.get(name, "")) if name in os.environ else ("missing", "not set in parent environment")
 
 
+_sourced_env_cache: dict[tuple[str, float], dict[str, str]] = {}
+
+
 def sourced_env(state: State) -> dict[str, str]:
     if not (state.env_file_enabled and state.env_file):
         return {}
+    path = os.path.expanduser(state.env_file)
+    # The env file is trusted shell input sourced by bash, so it may have side
+    # effects.  Cache by (path, mtime) so we only re-source when it changes,
+    # rather than spawning bash on every redraw of the Environment tab.
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    cache_key = (path, mtime)
+    if cache_key in _sourced_env_cache:
+        return _sourced_env_cache[cache_key]
     script = 'set -a; source "$1"; env -0'
     base = {name: os.environ.get(name, "") for name in DEFAULT_ENV_VARS if name in os.environ}
     try:
-        p = subprocess.run(["/bin/bash", "-c", script, "bash", os.path.expanduser(state.env_file)],
+        p = subprocess.run(["/bin/bash", "-c", script, "bash", path],
                            env=base, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
     except Exception:
         return {}
@@ -791,7 +834,9 @@ def sourced_env(state: State) -> dict[str, str]:
         if "=" in item:
             k, v = item.split("=", 1)
             result[k] = v
-    return {k: v for k, v in result.items() if base.get(k) != v or k not in base}
+    sourced = {k: v for k, v in result.items() if base.get(k) != v or k not in base}
+    _sourced_env_cache[cache_key] = sourced
+    return sourced
 
 
 def changes_rows(state: State, rows: List[Row], scope: str) -> None:
@@ -809,8 +854,14 @@ def changes_rows(state: State, rows: List[Row], scope: str) -> None:
         for p in unique(state.rw_paths + state.ro_paths + state.deny_paths):
             changes.append(f"+ {path_mode(state, p).upper()} {p}")
         for p, m in state.path_overrides.items():
-            if m != default_mode(p):
-                changes.append(f"{p}: {default_mode(p).upper()} → {m.upper()}")
+            if m == default_mode(p):
+                continue
+            # A member path whose owning category carries the same override is
+            # already covered by the category's own change line; don't repeat it.
+            cat = category_of(p)
+            if cat and cat != p and state.path_overrides.get(cat) == m:
+                continue
+            changes.append(f"{p}: {default_mode(p).upper()} → {m.upper()}")
     elif scope == "features":
         for f in state.enabled:
             changes.append(f"+ ENABLE {f}")
