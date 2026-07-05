@@ -37,11 +37,9 @@ that restricts those paths can't clobber the harness's own result file.
 
 ## How a probe reports its verdict
 
-`safehouse+`'s UI is curses, so the harness drives it through a PTY: it launches
-`safehouse+ /bin/sh -c '<probe>'`, which runs the probe in the sandbox on first
-launch, then waits at the menu. The probe's stdout is redirected to a file in the
-(writable) workdir; once the menu header appears the harness sends `q` to quit and
-reads that file. See `harness.py` for details.
+The harness launches `safehouse+ --script /bin/sh -c '<probe>'`, which runs the
+probe in the sandbox once and exits immediately (no curses menu), so the probe's
+stdout is captured directly as the verdict. See `harness.py` for details.
 
 ## Behavioral checklist
 
