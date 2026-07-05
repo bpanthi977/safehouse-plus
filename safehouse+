@@ -490,28 +490,19 @@ def run_capture(args: List[str]) -> str:
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-RESUME_PATTERNS = [
-    re.compile(r"To resume this session:\s*(.+)", re.IGNORECASE),
-    re.compile(r"To resume, run:\s*(.+)", re.IGNORECASE),
-    re.compile(r"Run\s+[`'\"]?(.+?(?:resume|--resume|--continue|--session).+?)[`'\"]?\s+to resume", re.IGNORECASE),
-]
 
 
-def detect_resume_command(output: str) -> List[str] | None:
+def detect_resume_command(output: str, program: str) -> List[str] | None:
+    """Find "<program> ... (--resume|--session|resume) <id>" in output from the end"""
+    pattern = re.compile(
+        rf"\b{re.escape(program)}\b.*?(--resume|--session|\bresume\b)\s+(\S+)",
+        re.IGNORECASE,
+    )
     clean = ANSI_RE.sub("", output.replace("\r", "\n"))
     for line in reversed(clean.splitlines()):
-        line = line.strip()
-        for pattern in RESUME_PATTERNS:
-            m = pattern.search(line)
-            if not m:
-                continue
-            cmd = m.group(1).strip().strip("`'")
-            try:
-                parsed = shlex.split(cmd)
-            except ValueError:
-                continue
-            if parsed:
-                return parsed
+        m = pattern.search(line.strip())
+        if m:
+            return [program, m.group(1), m.group(2)]
     return None
 
 
@@ -649,7 +640,7 @@ def launch_program(stdscr, state: State, command: List[str] | None = None) -> No
     status = 1
     try:
         output, status = run_pty_capture(argv)
-        detected = detect_resume_command(output)
+        detected = detect_resume_command(output, os.path.basename(command_to_run[0]))
         if detected:
             LAST_RESUME_COMMAND = detected
     finally:
