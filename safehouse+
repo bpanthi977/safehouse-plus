@@ -1236,13 +1236,19 @@ def first_run_ui(stdscr, state: State, original: State) -> None:
 
 
 def main() -> int:
+    args = sys.argv[1:]
+    if "--ensure-safehouse" in args:
+        # Used by install.sh right after installing safehouse+, so the
+        # safehouse dependency check/install happens as part of one
+        # continuous install flow instead of waiting for first real use.
+        return 0 if ensure_safehouse_available() else 1
+
     if not ensure_safehouse_available():
         print("safehouse+ cannot continue without safehouse.", file=sys.stderr)
         return 1
 
     state = State.load()
     original = copy.deepcopy(state)
-    args = sys.argv[1:]
     show_menu_first = False
     if "--menu" in args:
         show_menu_first = True
