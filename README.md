@@ -1,8 +1,6 @@
 # safehouse+
 
-`safehouse+` is a CLI application to run agents and other programs inside a sandbox for macOS. It runs any command you give (e.g. `safehouse+ claude`, `safehouse+ ./some-script.sh`) inside macOS's inbuilt sandboxing tool (called `sandbox-exec`). `safehouse+` builds upon [`safehouse`](https://agent-safehouse.dev) and provides a TUI to configure sandbox permissions, restart quickly, and see/export the generated `safehouse` policy without memorizing flags.
-
-It does not modify `safehouse`; it builds and runs `safehouse` commands for you.
+`safehouse+` is a CLI application to run agents and other programs inside a sandbox for macOS. It runs any command you give inside macOS's inbuilt sandboxing tool (called `sandbox-exec`). `safehouse+` builds upon [`safehouse`](https://agent-safehouse.dev) and provides a TUI to configure sandbox permissions, resume agent session with updated permissions, and see/export the generated `safehouse` policy without memorizing flags.
 
 ## Installation
 
@@ -18,7 +16,12 @@ Run a command in the sandbox:
 
 ```bash
 safehouse+ pi
+safehouse+ claude
+safehouse+ codex
 ```
+
+Quitting the program opens the settings UI, then resumes the session
+with your updated settings.
 
 Open the UI before running:
 
