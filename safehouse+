@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Interactive terminal launcher for agent-safehouse.
+"""TUI to configure and run AI agents in sandbox.
 
-Run: safehouse+ [--menu | --once | --script | --ensure-safehouse] [initial command ...]
+Run: safehouse+ [--menu | --once | --script | --help ] [initial command ...]
 
---menu             show the interactive menu first instead of running the given command immediately.
---script           run the command and exit immediately
---once             runs the command and exits immediately, show the safehouse command used
---ensure-safehouse check whether safehouse is installed (offering to install it if not), then exit.
+--script  run the command and exit immediately
+--menu    show the interactive menu first instead of running the given command immediately.
+--once    run the command and exit immediately; shows the safehouse command used
+--help    show this help documentation
 
-With no flags and no command, the interactive menu is shown. With no flags
-and a command, the command runs immediately and the interactive menu is
-shown afterward for tweaks/restarts.
+Without any flags the command runs and the interactive menu is shown
+after the command ends for tweaks/restarts. With no command, the
+interactive menu is shown.
+
 """
 from __future__ import annotations
 
@@ -1266,6 +1267,9 @@ def first_run_ui(stdscr, state: State, original: State) -> None:
 
 def main() -> int:
     args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
     if "--ensure-safehouse" in args:
         # Used by install.sh right after installing safehouse+, so the
         # safehouse dependency check/install happens as part of one
