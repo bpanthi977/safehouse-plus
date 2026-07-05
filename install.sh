@@ -50,9 +50,11 @@ else
 fi
 
 TARGET_DIR="$(dirname "$TARGET")"
+PATH_NEEDS_UPDATE=0
 case ":$PATH:" in
   *":$TARGET_DIR:"*) ;;
   *)
+    PATH_NEEDS_UPDATE=1
     echo
     echo "Note: $TARGET_DIR is not on your PATH."
     echo "Add it to your shell profile, e.g.:"
@@ -72,4 +74,8 @@ else
 fi
 
 echo
-echo "Done. Run 'safehouse+' to get started (after ensuring $TARGET_DIR is on your PATH)."
+if [ "$PATH_NEEDS_UPDATE" -eq 1 ]; then
+  echo "Done. Run 'safehouse+' to get started (after ensuring $TARGET_DIR is on your PATH)."
+else
+  echo "Done. Run 'safehouse+' to get started."
+fi
