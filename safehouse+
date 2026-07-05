@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Interactive terminal launcher for agent-safehouse.
 
-Run: safehouse+ [--once] [initial command ...]
+Run: safehouse+ [--once | --script] [initial command ...]
 
---once runs the command and exits immediately afterward instead of
-dropping into the interactive menu.
+--script run the command and exit immediately
+--once runs the command and exits immediately, show the safehouse command used
 """
 from __future__ import annotations
 
@@ -598,7 +598,7 @@ def run_pty_capture(argv: List[str]) -> tuple[str, int]:
     return captured.decode(errors="replace"), status_code
 
 
-def run_once(state: State) -> int:
+def run_once(state: State, quiet: bool = False) -> int:
     """Run state.command directly, without the curses menu, and return its exit status.
 
     stdin/stdout/stderr are inherited as-is, so the command behaves exactly as if run
@@ -608,7 +608,8 @@ def run_once(state: State) -> int:
         print("safehouse+: --once requires a command", file=sys.stderr)
         return 1
     argv, profile = state.launch_argv()
-    print(f"\n$ {shell_join(argv)}\n")
+    if not quiet:
+        print(f"\n$ {shell_join(argv)}\n")
     try:
         status = subprocess.run(argv).returncode
     finally:
@@ -1288,11 +1289,16 @@ def main() -> int:
     if "--once" in args:
         once = True
         args = [arg for arg in args if arg != "--once"]
+    script = False
+    if "--script" in args:
+        once = True
+        script = True
+        args = [arg for arg in args if arg != "--script"]
 
     if once:
         if args:
             state.command = args
-        return run_once(state)
+        return run_once(state, quiet=script)
 
     try:
         if args:
