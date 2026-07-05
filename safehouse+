@@ -654,6 +654,7 @@ class Row:
     tag: str = ""
     attr: int = 0
     indent: int = 0
+    inline: bool = False  # render detail on the same line as text (name → value)
 
 
 def effective_workdir(state: State) -> str:
@@ -930,20 +931,20 @@ def rows_for(state: State, tab: str, dirty: bool) -> List[Row]:
             rows.append(Row("info", "Ignored while full environment is enabled", tag="info", selectable=False))
         else:
             rows.append(Row("add_env", "Add variable", tag="add"))
-            rows += [Row("env_pass:" + name, name, env_value(name)[1], tag=env_value(name)[0]) for name in state.env_pass]
+            rows += [Row("env_pass:" + name, name, env_value(name)[1], tag=env_value(name)[0], inline=True) for name in state.env_pass]
         rows.append(Row("heading", "Passed variables", selectable=False))
         if state.env_mode == "full":
             rows.append(Row("info", "Full parent environment will be passed to the command", tag="all", selectable=False))
             rows.append(Row("heading", "Preview", selectable=False))
             for name in list(os.environ)[:12]:
-                rows.append(Row("info", name, os.environ.get(name, ""), tag="env", selectable=False))
-            rows.append(Row("info", "...", "more variables not shown", tag="env", selectable=False))
+                rows.append(Row("info", name, os.environ.get(name, ""), tag="env", selectable=False, inline=True))
+            rows.append(Row("info", "...", "more variables not shown", tag="env", selectable=False, inline=True))
         else:
             for name in DEFAULT_ENV_VARS:
-                rows.append(Row("info", name, os.environ.get(name, ""), tag="pass", selectable=False))
+                rows.append(Row("info", name, os.environ.get(name, ""), tag="pass", selectable=False, inline=True))
             for name, value in sourced_env(state).items():
                 if name not in DEFAULT_ENV_VARS:
-                    rows.append(Row("info", name, value, tag="file", selectable=False))
+                    rows.append(Row("info", name, value, tag="file", selectable=False, inline=True))
         return rows
 
     rows = []
@@ -1144,7 +1145,9 @@ def draw_rows(stdscr, rows: List[Row], idx: int, top: int) -> None:
             details = row.detail.splitlines()
             first_x = min(max(32, x + min(len(text_lines[-1]), 28) + 2), max(2, curses.COLS - 30))
             for i, d in enumerate(details):
-                if i > 0 or text_lines:
+                # Inline rows (name → value) keep the first detail line on the
+                # same row as the label; everything else drops it below.
+                if i > 0 or (text_lines and not row.inline):
                     y += 1
                     if y >= max_y: break
                 for j, line in enumerate(wrapped_lines(d, max(1, curses.COLS - first_x - 1))):
