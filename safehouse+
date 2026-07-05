@@ -1155,6 +1155,43 @@ def wrapped_lines(text: str, width: int) -> List[str]:
     return lines
 
 
+def row_height(row: Row) -> int:
+    """Number of terminal lines draw_rows spends on this row (including the
+    trailing blank line before the next one). Mirrors draw_rows's own layout
+    math so scroll bounds can be computed without a curses window."""
+    if row.key == "heading":
+        return 1
+    x = 2 + row.indent
+    if row.tag:
+        x += len(f"[{row.tag}]") + 1
+    text_width = max(1, curses.COLS - x - 1)
+    text_lines = wrapped_lines(row.text, text_width)
+    height = len(text_lines)
+    if row.detail:
+        first_x = min(max(32, x + min(len(text_lines[-1]), 28) + 2), max(2, curses.COLS - 30))
+        detail_width = max(1, curses.COLS - first_x - 1)
+        for i, d in enumerate(row.detail.splitlines()):
+            wrapped = wrapped_lines(d, detail_width)
+            if i > 0 or not row.inline:
+                height += len(wrapped)
+            else:
+                height += max(0, len(wrapped) - 1)
+    return height + 1
+
+
+def max_scroll_top(rows: List[Row], visible_height: int) -> int:
+    """Largest scroll offset at which rows[top:] still fits in visible_height,
+    so the arrow keys can reach the last wrapped line of trailing rows."""
+    total = 0
+    top = len(rows)
+    for i in range(len(rows) - 1, -1, -1):
+        total += row_height(rows[i])
+        if total > visible_height:
+            break
+        top = i
+    return top
+
+
 def draw_rows(stdscr, rows: List[Row], idx: int, top: int) -> None:
     y = 5
     max_y = curses.LINES - 2
@@ -1227,10 +1264,9 @@ def main_ui(stdscr, state: State, original: State | None = None) -> None:
         rows = rows_for(state, tab, dirty)
         idx = clamp_selection(rows, idx_by_tab[tab])
         idx_by_tab[tab] = idx
-        height = max(1, curses.LINES - 8)
-        top = min(top_by_tab[tab], max(0, len(rows) - height))
-        if idx < top: top = idx
-        if idx >= top + height: top = idx - height + 1
+        height = max(1, curses.LINES - 7)
+        max_top = max_scroll_top(rows, height)
+        top = max(0, min(top_by_tab[tab], max_top))
         top_by_tab[tab] = top
 
         stdscr.erase()
@@ -1257,9 +1293,26 @@ def main_ui(stdscr, state: State, original: State | None = None) -> None:
         elif ch in (9,):
             active = (active + 1) % len(TABS)
         elif ch in (curses.KEY_UP, ord('k'), 16):
-            idx_by_tab[tab] = move_selection(rows, idx, -1)
+            new_idx = move_selection(rows, idx, -1)
+            if new_idx != idx:
+                idx_by_tab[tab] = new_idx
+                if new_idx < top_by_tab[tab]:
+                    top_by_tab[tab] = new_idx
+            else:
+                # Already at the first selectable row: keep scrolling up so
+                # non-selectable rows above it (if any) can still be reached.
+                top_by_tab[tab] = max(0, top_by_tab[tab] - 1)
         elif ch in (curses.KEY_DOWN, ord('j'), 14):
-            idx_by_tab[tab] = move_selection(rows, idx, 1)
+            new_idx = move_selection(rows, idx, 1)
+            if new_idx != idx:
+                idx_by_tab[tab] = new_idx
+                if new_idx >= top_by_tab[tab] + height:
+                    top_by_tab[tab] = new_idx - height + 1
+            else:
+                # Already at the last selectable row: keep scrolling down so
+                # trailing non-selectable rows (e.g. the generated profile)
+                # can still be reached with the arrow keys / mouse wheel.
+                top_by_tab[tab] = min(max_top, top_by_tab[tab] + 1)
         elif ch == ord(' ') and rows[idx].key.startswith("category:"):
             cycle_category(state, rows[idx].key[9:])
         elif ch == ord(' ') and rows[idx].key == "env_file":
