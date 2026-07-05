@@ -36,7 +36,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAFEHOUSE_PLUS = os.path.join(ROOT, "safehouse+")
-SAFEHOUSE_BIN = os.environ.get("SAFEHOUSE_BIN", os.path.join(ROOT, "safehouse"))
+SAFEHOUSE_BIN = os.environ.get("SAFEHOUSE_BIN") or shutil.which("safehouse") or "safehouse"
 
 MENU_MARKER = b"safehouse+"   # drawn only after the probe completes
 RESULT_FILE = "probe_result.txt"

@@ -29,7 +29,7 @@ Requirements:
 - Must run **outside** any sandbox — you cannot nest `sandbox-exec`. (A preflight
   check aborts with a clear message if a sandboxed probe can't run.)
 - `SAFEHOUSE_BIN` env var overrides which `safehouse` binary is used (defaults to
-  `./safehouse` in the repo root).
+  the `safehouse` found on `PATH`).
 
 Test workdirs are created under `~/.safehouse-plus-tests/` and removed after each
 run. That location is deliberately outside `/tmp` and `/var/folders`, so a test
