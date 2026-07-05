@@ -1,8 +1,16 @@
 # safehouse+
 
-`safehouse+` is a terminal UI for running commands through [`safehouse`](https://agent-safehouse.dev). It helps you tune sandbox permissions, restart quickly, and see/export the generated `safehouse` policy without memorizing flags.
+`safehouse+` is a CLI application to run agents and other programs inside a sandbox for macOS. It runs any command you give (e.g. `safehouse+ claude`, `safehouse+ ./some-script.sh`) inside macOS's inbuilt sandboxing tool (called `sandbox-exec`). `safehouse+` builds upon [`safehouse`](https://agent-safehouse.dev) and provides a TUI to configure sandbox permissions, restart quickly, and see/export the generated `safehouse` policy without memorizing flags.
 
 It does not modify `safehouse`; it builds and runs `safehouse` commands for you.
+
+## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bpanthi977/safehouse-plus/main/install.sh | bash
+```
+
+This installs `safehouse+` to `~/.local/bin` (or updates it in place if already on your `PATH`).
 
 ## Usage
 
