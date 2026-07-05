@@ -230,7 +230,14 @@ class State:
         return cls()
 
     def save(self) -> None:
-        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2) + "\n")
+        CONFIG_PATH.write_text(json.dumps(self.settings_dict(), indent=2) + "\n")
+
+    def settings_dict(self) -> dict:
+        # The command a user happened to run isn't a saved setting, so it's
+        # excluded here and from dirty-checking below.
+        d = asdict(self)
+        d.pop("command", None)
+        return d
 
     def safehouse_args(self, append_profile: str | None = None) -> List[str]:
         args: List[str] = []
@@ -1179,10 +1186,10 @@ def main_ui(stdscr, state: State, original: State | None = None) -> None:
     active = 0
     idx_by_tab = {tab: 0 for tab in TABS}
     top_by_tab = {tab: 0 for tab in TABS}
-    original_snapshot = asdict(original or copy.deepcopy(state))
+    original_snapshot = (original or copy.deepcopy(state)).settings_dict()
     while True:
         tab = TABS[active]
-        dirty = asdict(state) != original_snapshot
+        dirty = state.settings_dict() != original_snapshot
         rows = rows_for(state, tab, dirty)
         idx = clamp_selection(rows, idx_by_tab[tab])
         idx_by_tab[tab] = idx
@@ -1205,7 +1212,8 @@ def main_ui(stdscr, state: State, original: State | None = None) -> None:
             stdscr.clear()
             continue
         if ch in (3, ord('q')):
-            state.save(); return
+            if dirty: state.save()
+            return
         if ch == ord('D'):
             if tab == "Run" or delete_or_reset(state, rows[idx]): return
         elif ch in (curses.KEY_RIGHT,):
@@ -1267,7 +1275,8 @@ def main() -> int:
         else:
             curses.wrapper(main_ui, state, original)
     except KeyboardInterrupt:
-        state.save()
+        if state.settings_dict() != original.settings_dict():
+            state.save()
         return 130
     return 0
 
