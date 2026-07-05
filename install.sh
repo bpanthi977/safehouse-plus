@@ -3,6 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/bpanthi977/safehouse-plus/main/install.sh | bash
+#   ./install.sh --local   # install the safehouse+ script from the current folder instead of GitHub
 #
 # Env overrides:
 #   SAFEHOUSE_PLUS_REPO     org/repo to install from (default: bpanthi977/safehouse-plus)
@@ -10,6 +11,17 @@
 #   SAFEHOUSE_PLUS_BIN_DIR  install directory (default: ~/.local/bin)
 
 set -euo pipefail
+
+LOCAL=0
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL=1 ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      exit 1
+      ;;
+  esac
+done
 
 REPO="${SAFEHOUSE_PLUS_REPO:-bpanthi977/safehouse-plus}"
 REF="${SAFEHOUSE_PLUS_REF:-main}"
@@ -30,8 +42,18 @@ fi
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "Checking ${URL}..."
-curl -fsSL "$URL" -o "$TMP"
+if [ "$LOCAL" -eq 1 ]; then
+  SRC="$(pwd)/safehouse+"
+  if [ ! -f "$SRC" ]; then
+    echo "Error: --local given but $SRC not found." >&2
+    exit 1
+  fi
+  echo "Using local $SRC..."
+  cp "$SRC" "$TMP"
+else
+  echo "Checking ${URL}..."
+  curl -fsSL "$URL" -o "$TMP"
+fi
 
 if [ -f "$TARGET" ] && cmp -s "$TMP" "$TARGET"; then
   echo "safehouse+ is already up to date."
